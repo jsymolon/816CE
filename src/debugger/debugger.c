@@ -73,6 +73,7 @@ cmd_err_msg cmd_err_msgs[] = {
      " > aaaaaa: xx yy zz\n"
      " > save [mem|cpu] filename\n"
      " > load mem (mos) (offset) filename\n"
+     " > load intel filename\n"
      " > load cpu filename\n"
      " > sym filename\n"
      " > cpu [reg] xxxx\n"
@@ -418,6 +419,169 @@ bool is_addr_do_parse(char *str, uint32_t *val, symbol_table_t *st)
         return false;
     }
     return true;
+}
+
+/**
+ * Decode n ASCII chars into a hex value
+ * 
+ * @param buffer - ASCII buffer 
+ * @param count - 2 - 8 chars to convert
+ * @param value - value converted
+ * 
+ * Returns true if ok
+ */
+bool read_n_ascii_hex(char *buffer, uint8_t count, uint32_t *value) {
+
+    char buff[256];
+
+    for (uint8_t cnt = 0; cnt < count; cnt++) {
+        buff[cnt] = buffer[cnt];
+    }
+    buff[count] = '\0';
+
+    return is_hex_do_parse(&buff[0], value);
+}
+
+/** 
+ * Decode an ASCII line from the .hex file into memory
+ * 
+ * @param buffer - reference to the memory area holding ASCII
+ * @param *mem The memory to store the data into
+ * 
+ * Returns - true if EOF line is decoded
+ */
+bool decode_intel_line(char *buffer, memory_t *mem) {
+
+    uint8_t src_idx = 1; // skip ':'
+    uint32_t base_addr = 0;
+    uint32_t count = 0;
+    uint32_t value = 0;
+
+    // 5 fields to run through, byte cnt, addr, rec type, data and check sum.  data is 0-n bytes
+    for (int f_idx = 0; f_idx < 5; f_idx++) {
+        switch (f_idx)  {
+        case 0: // # bytes
+            if (read_n_ascii_hex(&buffer[src_idx], 2, &value)) {
+                count = value;
+            }
+            src_idx += 2;
+            break;
+        case 1: // addr
+            if (read_n_ascii_hex(&buffer[src_idx], 4, &value)) {
+                base_addr = value;
+            }
+            src_idx += 4;
+            break;
+        case 2: // type
+            if (read_n_ascii_hex(&buffer[src_idx], 2, &value)) {
+                if (value != 0) {
+                    return false;  // not a decodable line for this CPU
+                }
+            }
+            src_idx += 2;
+            break;
+        case 3: // data - read 2 ASCII, convert to byte, store
+            for(uint8_t data_cnt = 0; data_cnt < count; data_cnt++) {
+                uint32_t d_value = 0;
+                if (read_n_ascii_hex(&buffer[src_idx], 2, &d_value)) {
+                    uint8_t d_byte = d_value;
+                    // Copy data into the memory
+                    _init_mem_arr(mem, &d_byte, base_addr, 1);
+                    src_idx += 2;
+                    base_addr++;
+                }
+            }
+            break;
+        case 4: // chksum
+            // TODO: chksum read
+            break;
+        default :
+            break;
+        }
+    }
+    return CMD_OK;
+}
+
+/** 
+ * Load a intel format into memory
+ * Note:WDC Tools produce this type of file ".hex"
+ * 
+ * @param *filename The path of the file to load
+ * @param *mem The memory to store the data into
+ * 
+ * -----
+ * Note segments are for the x86
+ * 
+ * chksum - 
+ * example data record = 
+ * :0300300002337A1E, the sum of the decoded byte values is 03 + 00 + 30 + 00 + 02 + 33 + 7A = E2, 
+ * which has LSB value E2. The two's complement of E2 is 1E
+ * 
+ * validity check = 
+ * : 03 + 00 + 30 + 00 + 02 + 33 + 7A + 1E = 100, which has LSB value 00
+ * 
+ * Colon starts record/line
+ * 6 std hex codes - (note examples use space to separate bytes)
+ * 
+ * Data -    : SZ ADDR TT .... chksum
+ *           : 0B 0010 00 6164647265737320676170 A7
+ * EOF  -    : SZ 0000 TT chksum
+ *           : 00 0000 01 FF
+ * ExSegAddr : 02 ADDR CNT base chksum
+ *           : 02 0000 02  1200 EA
+ * StSegAddr : 04 0000
+ *           : 04 0000 03  00003800 C1
+ * ExLinAddr : 02 0000
+ *           : 02 0000 04  0800 F2
+ * StLinAddr : 04 0000
+ *           : 04 0000 05  000000CD 2A
+ * 
+ * (NOTE WDC Tools usually use the Data and EOF only)
+ */
+cmd_err_t load_intel_file(char *filename, memory_t *mem)
+{
+    char buf[1024];
+
+    // Get the size of the file
+    struct stat finfo;
+
+    // Lots of error values!
+    if (stat(filename, &finfo) != 0) {
+        switch (errno) {
+        case EACCES:
+            return CMD_FILE_PERM_DENIED;
+            break;
+        case ELOOP:
+            return CMD_FILE_LOOP;
+            break;
+        case ENAMETOOLONG:
+            return CMD_FILE_NAME_TOO_LONG;
+            break;
+        case ENOTDIR:
+        case ENOENT:
+            return CMD_FILE_NOT_EXIST;
+            break;
+        default:
+            return CMD_FILE_UNKNOWN_ERROR;
+        }
+    }
+
+    //size_t size = finfo.st_size;
+
+    // All good, let's open the file
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        return CMD_FILE_IO_ERROR;
+    }
+
+    //bool ok = true;
+    while (fgets(buf, sizeof buf, fp) != NULL) {
+        // line read, decode ASCII
+        decode_intel_line(&buf[0], mem);
+    }
+
+    fclose(fp);
+    return CMD_OK;
 }
 
 
@@ -1088,6 +1252,23 @@ cmd_status_t command_execute( cmd_err_t *status,
             }
 
             *status = load_file_cpu(tok, cpu);
+            if (*status == CMD_OK) {
+                return STAT_OK;
+            }
+            else {
+                return STAT_ERR;
+            }
+        }
+        else if (strcmp(tok, "intel") == 0 ) { // intel syntax file load
+            // Get filename NOTE full path needed
+            tok = strtok_r(NULL, " \t\n\r", &state);
+
+            if (!tok) {
+                *status = CMD_EXPECTED_FILENAME;
+                return STAT_ERR;
+            }
+
+            *status = load_intel_file (tok, mem);
             if (*status == CMD_OK) {
                 return STAT_OK;
             }
@@ -1947,11 +2128,12 @@ void print_help_and_exit()
         " $ 816ce [OPTIONS]\n"
         "\n"
         "Options:\n"
-        " --cpu-file filename ...... Preload the CPU with a saved state\n"
-        " --mem [offset] filename .. Load memory at offset (in hex) with a file\n"
-        " --mem-mos filename ....... Load a binary file formatted for the LLVM MOS simulator into memory\n"
+        " --cpu-file filename ........ Preload the CPU with a saved state\n"
+        " --mem [offset] filename .... Load memory at offset (in hex) with a file\n"
+        " --mem-mos filename ......... Load a binary file formatted for the LLVM MOS simulator into memory\n"
         " --cmd \"command here\" ..... Run a command during initialization\n"
-        " --cmd-file filename ...... Run commands from a file during initialization\n"
+        " --cmd-file filename ........ Run commands from a file during initialization\n"
+        " --load-intel filename ...... Load an Intel syntax HEX file\n"
         "\n"
         );
     exit(EXIT_SUCCESS);
@@ -2100,6 +2282,9 @@ int main(int argc, char *argv[])
                 else if (strcmp(argv[i], "--cmd-file") == 0) {
                     cli_pstate = 4;
                 }
+                else if (strcmp(argv[i], "--load-intel") == 0) {
+                    cli_pstate = 6;
+                }
                 else if (strcmp(argv[i], "--help") == 0) {
                     print_help_and_exit();
                 }
@@ -2129,6 +2314,14 @@ int main(int argc, char *argv[])
             case 5:
                 // Takes and loads an executable formatted for the llvm-mos simulator
                 if ((cmd_err = load_file_mem(argv[i], memory, base_addr, MF_LLVM_MOS_SIM)) > 0) {
+                    printf("Error! (%s) %s\n", argv[i], cmd_err_msgs[cmd_err].msg);
+                    exit(EXIT_FAILURE);
+                }
+                cli_pstate = 0;
+                break;
+            case 6:
+                // Loads an Intel syntax HEX ASCII byte file
+                if ((cmd_err = load_intel_file(argv[i], memory)) > 0) {
                     printf("Error! (%s) %s\n", argv[i], cmd_err_msgs[cmd_err].msg);
                     exit(EXIT_FAILURE);
                 }

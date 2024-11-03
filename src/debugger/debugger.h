@@ -128,7 +128,8 @@ typedef enum cmd_err_t {
     CMD_OUT_OF_MEM,
     CMD_UNSUPPORTED_DEVICE,
     CMD_PORT_NUM_INVALID,
-    CMD_UART_DISABLED
+    CMD_UART_DISABLED,
+    CMD_PARSER_ERROR
 } cmd_err_t;
 
 // Error message box type
